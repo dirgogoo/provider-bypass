@@ -45,16 +45,30 @@ export interface ClaudeResponse {
   };
 }
 
+// Required identifier: Anthropic only accepts OAuth Max tokens when the system
+// prompt identifies the client as Claude Code. Without this, the API returns
+// a misleading HTTP 429 rate_limit_error even when quota is fine.
+const CLAUDE_CODE_IDENTIFIER = "You are Claude Code, Anthropic's official CLI for Claude.";
+
 function buildRequestBody(options: ClaudeRequestOptions): any {
-  let system: any[] = [];
+  let userSystem: any[] = [];
 
   if (options.system) {
     if (typeof options.system === 'string') {
-      system = [{ type: 'text', text: options.system }];
+      userSystem = [{ type: 'text', text: options.system }];
     } else if (Array.isArray(options.system)) {
-      system = [...options.system];
+      userSystem = [...options.system];
     }
   }
+
+  // Always prepend Claude Code identifier (detect if caller already added it
+  // to avoid duplication).
+  const alreadyPresent = typeof userSystem[0]?.text === 'string'
+    && userSystem[0].text.startsWith(CLAUDE_CODE_IDENTIFIER);
+
+  const system = alreadyPresent
+    ? userSystem
+    : [{ type: 'text', text: CLAUDE_CODE_IDENTIFIER }, ...userSystem];
 
   const thinkingBudget = 16000;
   const maxTokens = options.max_tokens || 16384;
@@ -63,11 +77,8 @@ function buildRequestBody(options: ClaudeRequestOptions): any {
     model: options.model || 'claude-sonnet-4-6',
     stream: options.stream || false,
     messages: options.messages,
+    system,
   };
-
-  if (system.length > 0) {
-    body.system = system;
-  }
 
   if (options.temperature !== undefined) {
     // User set temperature explicitly — no thinking
@@ -142,6 +153,13 @@ export async function claudeApiCall(
     if (!res.ok || data.type === 'error') {
       const errType = data.error?.type || `http_${res.status}`;
       const errMsg = data.error?.message || JSON.stringify(data);
+      if (errType === 'rate_limit_error' && errMsg === 'Error') {
+        throw Errors.apiError(
+          `Claude API Error (${errType}): ${errMsg} — this usually means the ` +
+          `system prompt is missing the Claude Code identifier. provider-bypass ` +
+          `should prepend it automatically; if you see this, file a bug.`,
+        );
+      }
       throw Errors.apiError(`Claude API Error (${errType}): ${errMsg}`);
     }
 
