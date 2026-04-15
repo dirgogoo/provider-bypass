@@ -16,6 +16,7 @@ export function createClaudeStreamAdapter(onEvent: (event: StreamEvent) => void)
   let responseId = generateId('msg');
   let currentBlockIndex = 0;
   const blockIdMap = new Map<number, string>();
+  const skippedIndices = new Set<number>(); // thinking/signature blocks to skip
 
   return {
     /**
@@ -44,9 +45,14 @@ export function createClaudeStreamAdapter(onEvent: (event: StreamEvent) => void)
           return;
         }
 
-        // content_block_start → response.output_item.added
+        // content_block_start → response.output_item.added (skip thinking/signature)
         if (event.type === 'content_block_start') {
           const block = event.content_block;
+          if (block?.type === 'thinking' || block?.type === 'signature') {
+            skippedIndices.add(event.index);
+            return;
+          }
+
           const itemId = generateId('msg');
           blockIdMap.set(event.index, itemId);
 
@@ -91,6 +97,7 @@ export function createClaudeStreamAdapter(onEvent: (event: StreamEvent) => void)
 
         // content_block_delta → text delta / function call args delta
         if (event.type === 'content_block_delta') {
+          if (skippedIndices.has(event.index)) return;
           const itemId = blockIdMap.get(event.index) || '';
 
           if (event.delta?.type === 'text_delta') {
@@ -112,20 +119,12 @@ export function createClaudeStreamAdapter(onEvent: (event: StreamEvent) => void)
             });
           }
 
-          if (event.delta?.type === 'thinking_delta') {
-            onEvent({
-              type: 'response.output_text.delta',
-              content_index: 0,
-              delta: event.delta.thinking,
-              item_id: itemId,
-              output_index: currentBlockIndex,
-            });
-          }
           return;
         }
 
         // content_block_stop → response.output_item.done
         if (event.type === 'content_block_stop') {
+          if (skippedIndices.has(event.index)) return;
           const itemId = blockIdMap.get(event.index) || '';
           onEvent({
             type: 'response.output_item.done',

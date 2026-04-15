@@ -10,7 +10,10 @@ export async function executeRest(
     if (config.body_template) {
       body = config.body_template.replace(
         /\{\{(\w+)\}\}/g,
-        (_, key) => JSON.stringify(input[key] ?? ''),
+        (_, key) => {
+          const val = input[key] ?? '';
+          return typeof val === 'string' ? val : JSON.stringify(val);
+        },
       );
     } else {
       body = JSON.stringify(input);

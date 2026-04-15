@@ -22,8 +22,8 @@ export class BypassError extends Error {
 }
 
 export const Errors = {
-  credentialsNotFound: (provider: string) =>
-    new BypassError('CREDENTIALS_NOT_FOUND', `${provider} credentials not found. Please install and log in first.`),
+  credentialsNotFound: (msg: string) =>
+    new BypassError('CREDENTIALS_NOT_FOUND', msg),
 
   tokenExpired: (provider: string) =>
     new BypassError('TOKEN_EXPIRED', `${provider} token expired and auto-refresh failed.`),

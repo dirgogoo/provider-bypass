@@ -1,6 +1,6 @@
 {
   "name": "@duckstech/provider-bypass",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Direct API access to Claude and ChatGPT using local CLI credentials. No API keys needed.",
   "type": "module",
   "main": "./dist/index.cjs",

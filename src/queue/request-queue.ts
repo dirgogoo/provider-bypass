@@ -7,8 +7,8 @@ export function createRequestQueue(concurrency: number): InstanceType<typeof PQu
 export function getQueueStats(queue: InstanceType<typeof PQueue>, concurrency: number) {
   return {
     concurrency,
-    pending: queue.pending,
-    active: queue.size,
-    idle: queue.pending === 0 && queue.size === 0,
+    pending: queue.size,      // waiting items
+    active: queue.pending,    // currently executing
+    idle: queue.size === 0 && queue.pending === 0,
   };
 }

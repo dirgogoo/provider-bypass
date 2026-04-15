@@ -44,7 +44,7 @@ function buildRequestBody(options: CodexRequestOptions): any {
 
   body.instructions = options.instructions || 'You are a helpful assistant.';
 
-  if (options.max_output_tokens) body.max_output_tokens = options.max_output_tokens;
+  // ChatGPT backend does not support max_output_tokens
   if (options.temperature !== undefined) body.temperature = options.temperature;
   if (options.reasoning) body.reasoning = options.reasoning;
 
@@ -101,8 +101,9 @@ export async function codexApiCallStream(
 
   resetTimeout();
 
+  const onAbort = () => controller.abort();
   if (abortSignal) {
-    abortSignal.addEventListener('abort', () => controller.abort());
+    abortSignal.addEventListener('abort', onAbort, { once: true });
   }
 
   try {
@@ -114,10 +115,14 @@ export async function codexApiCallStream(
     });
 
     if (!res.ok || !res.body) {
-      const data = await res.json() as any;
-      throw Errors.apiError(
-        `Codex API Error (${res.status}): ${data.error?.message || data.error?.type || JSON.stringify(data)}`,
-      );
+      let errMsg: string;
+      try {
+        const data = await res.json() as any;
+        errMsg = data.error?.message || data.error?.type || JSON.stringify(data);
+      } catch {
+        errMsg = await res.text().catch(() => 'unknown');
+      }
+      throw Errors.apiError(`Codex API Error (${res.status}): ${errMsg}`);
     }
 
     const reader = res.body.getReader();
@@ -199,5 +204,6 @@ export async function codexApiCallStream(
     throw err;
   } finally {
     clearActiveTimeout();
+    abortSignal?.removeEventListener('abort', onAbort);
   }
 }

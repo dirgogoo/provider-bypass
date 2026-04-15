@@ -39,8 +39,8 @@ export class ProviderBypass {
   constructor(options: ClientOptions = {}) {
     this.logger = options.logger || createDefaultLogger();
     this.defaultModel = options.defaultModel || 'claude-sonnet-4-6';
-    this.defaultTimeout = options.timeout || 10 * 60 * 1000;
-    this.concurrency = options.concurrency || 3;
+    this.defaultTimeout = options.timeout ?? 10 * 60 * 1000;
+    this.concurrency = options.concurrency ?? 3;
     this.claudeApiUrl = options.claude?.apiUrl;
     this.codexApiUrl = options.codex?.apiUrl;
 
@@ -59,7 +59,7 @@ export class ProviderBypass {
 
     const model = request.model || this.defaultModel;
     const allTools = this.resolveAllTools(request);
-    const timeout = request.timeout || this.defaultTimeout;
+    const timeout = request.timeout ?? this.defaultTimeout;
 
     if (isClaudeModel(model)) {
       return this.sendClaude(model, request, allTools, timeout);
@@ -76,7 +76,7 @@ export class ProviderBypass {
 
     const model = request.model || this.defaultModel;
     const allTools = this.resolveAllTools(request);
-    const timeout = request.timeout || this.defaultTimeout;
+    const timeout = request.timeout ?? this.defaultTimeout;
 
     if (isClaudeModel(model)) {
       yield* this.streamClaude(model, request, allTools, timeout);
@@ -123,6 +123,7 @@ export class ProviderBypass {
       claudeApiCall(this.claudeAuth, this.claudeApiUrl, {
         model,
         max_tokens: request.max_output_tokens || 16384,
+        temperature: request.temperature,
         system: request.instructions,
         messages,
         tools: claudeTools,
@@ -176,6 +177,7 @@ export class ProviderBypass {
       claudeApiCallStream(this.claudeAuth, this.claudeApiUrl, {
         model,
         max_tokens: request.max_output_tokens || 16384,
+        temperature: request.temperature,
         system: request.instructions,
         messages,
         tools: claudeTools,
@@ -195,10 +197,16 @@ export class ProviderBypass {
     }).catch((err) => {
       error = err;
       done = true;
+      const errEvent: StreamEvent = {
+        type: 'error',
+        error: { type: 'api_error', message: err.message },
+      };
       if (resolveNext) {
         const resolve = resolveNext;
         resolveNext = null;
-        resolve({ value: undefined as any, done: true });
+        resolve({ value: errEvent, done: false });
+      } else {
+        events.push(errEvent);
       }
     });
 
@@ -278,6 +286,8 @@ export class ProviderBypass {
     let done = false;
     let error: Error | null = null;
 
+    const streamStart = Date.now();
+
     const apiPromise = this.queue.add(() =>
       codexApiCallStream(this.codexAuth, this.codexApiUrl, {
         model,
@@ -293,6 +303,12 @@ export class ProviderBypass {
       }, (rawEvent) => {
         const parsed = parseCodexStreamEvent(rawEvent);
         if (!parsed) return;
+
+        // Inject latencyMs and provider into completed events
+        if (parsed.type === 'response.completed' && parsed.response) {
+          parsed.response.latencyMs = Date.now() - streamStart;
+          parsed.response.provider = 'codex';
+        }
 
         if (resolveNext) {
           const resolve = resolveNext;
@@ -312,10 +328,16 @@ export class ProviderBypass {
     }).catch((err) => {
       error = err;
       done = true;
+      const errEvent: StreamEvent = {
+        type: 'error',
+        error: { type: 'api_error', message: err.message },
+      };
       if (resolveNext) {
         const resolve = resolveNext;
         resolveNext = null;
-        resolve({ value: undefined as any, done: true });
+        resolve({ value: errEvent, done: false });
+      } else {
+        events.push(errEvent);
       }
     });
 

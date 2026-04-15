@@ -56,9 +56,11 @@ function buildRequestBody(options: ClaudeRequestOptions): any {
     }
   }
 
+  const thinkingBudget = 16000;
+  const maxTokens = options.max_tokens || 16384;
+
   const body: any = {
     model: options.model || 'claude-sonnet-4-6',
-    max_tokens: options.max_tokens || 16384,
     stream: options.stream || false,
     messages: options.messages,
   };
@@ -67,9 +69,16 @@ function buildRequestBody(options: ClaudeRequestOptions): any {
     body.system = system;
   }
 
-  // Enable thinking with generous budget
-  body.temperature = 1;
-  body.thinking = { type: 'enabled', budget_tokens: 16000 };
+  if (options.temperature !== undefined) {
+    // User set temperature explicitly — no thinking
+    body.temperature = options.temperature;
+    body.max_tokens = maxTokens;
+  } else {
+    // Enable thinking by default (requires temperature=1, max_tokens > budget_tokens)
+    body.temperature = 1;
+    body.thinking = { type: 'enabled', budget_tokens: thinkingBudget };
+    body.max_tokens = Math.max(maxTokens, thinkingBudget + 1024);
+  }
 
   if (options.tools && options.tools.length > 0) {
     body.tools = options.tools;
@@ -110,9 +119,9 @@ export async function claudeApiCall(
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
-
+  const onAbort = () => controller.abort();
   if (abortSignal) {
-    abortSignal.addEventListener('abort', () => controller.abort());
+    abortSignal.addEventListener('abort', onAbort, { once: true });
   }
 
   try {
@@ -123,10 +132,17 @@ export async function claudeApiCall(
       signal: controller.signal,
     });
 
-    const data = await res.json() as any;
+    let data: any;
+    try {
+      data = await res.json();
+    } catch {
+      throw Errors.apiError(`Claude API Error (http_${res.status}): ${await res.text().catch(() => 'unknown')}`);
+    }
 
-    if (data.type === 'error') {
-      throw Errors.apiError(`Claude API Error: ${data.error?.type} - ${data.error?.message}`);
+    if (!res.ok || data.type === 'error') {
+      const errType = data.error?.type || `http_${res.status}`;
+      const errMsg = data.error?.message || JSON.stringify(data);
+      throw Errors.apiError(`Claude API Error (${errType}): ${errMsg}`);
     }
 
     const latencyMs = Date.now() - startTime;
@@ -159,6 +175,7 @@ export async function claudeApiCall(
     throw err;
   } finally {
     clearTimeout(timer);
+    abortSignal?.removeEventListener('abort', onAbort);
   }
 }
 
@@ -193,8 +210,9 @@ export async function claudeApiCallStream(
 
   resetTimeout();
 
+  const onAbort = () => controller.abort();
   if (abortSignal) {
-    abortSignal.addEventListener('abort', () => controller.abort());
+    abortSignal.addEventListener('abort', onAbort, { once: true });
   }
 
   try {
@@ -206,8 +224,14 @@ export async function claudeApiCallStream(
     });
 
     if (!res.ok || !res.body) {
-      const data = await res.json() as any;
-      throw Errors.apiError(`Claude API Error: ${data.error?.type} - ${data.error?.message}`);
+      let errMsg: string;
+      try {
+        const data = await res.json() as any;
+        errMsg = `${data.error?.type || 'http_' + res.status}: ${data.error?.message || JSON.stringify(data)}`;
+      } catch {
+        errMsg = `http_${res.status}: ${await res.text().catch(() => 'unknown')}`;
+      }
+      throw Errors.apiError(`Claude API Error (${errMsg})`);
     }
 
     const reader = res.body.getReader();
@@ -359,5 +383,6 @@ export async function claudeApiCallStream(
     throw err;
   } finally {
     clearActiveTimeout();
+    abortSignal?.removeEventListener('abort', onAbort);
   }
 }
