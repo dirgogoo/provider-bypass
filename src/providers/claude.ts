@@ -102,11 +102,12 @@ function buildRequestBody(options: ClaudeRequestOptions): any {
 }
 
 /**
- * Filter out thinking/signature blocks from response content.
+ * Filter out signature blocks from response content (opaque metadata).
+ * Thinking blocks are preserved and exposed as reasoning items.
  */
 function cleanContent(content: any[]): any[] {
   return (content || [])
-    .filter((b: any) => b.type !== 'thinking' && b.type !== 'signature')
+    .filter((b: any) => b.type !== 'signature')
     .map((b: any) => {
       const { caller, ...rest } = b;
       return rest;
@@ -260,7 +261,7 @@ export async function claudeApiCallStream(
     let inputTokens = 0;
     let outputTokens = 0;
 
-    const thinkingBlockIndices = new Set<number>();
+    const skippedBlockIndices = new Set<number>(); // signature blocks only
     const contentBlocks: any[] = [];
     const indexMap = new Map<number, number>();
     let nextCleanIndex = 0;
@@ -297,7 +298,7 @@ export async function claudeApiCallStream(
             const blockType = event.content_block?.type;
 
             if (blockType === 'signature') {
-              thinkingBlockIndices.add(event.index);
+              skippedBlockIndices.add(event.index);
               continue;
             }
 
@@ -316,7 +317,7 @@ export async function claudeApiCallStream(
           }
 
           if (event.type === 'content_block_delta') {
-            if (thinkingBlockIndices.has(event.index)) continue;
+            if (skippedBlockIndices.has(event.index)) continue;
             if (event.delta?.type === 'signature_delta') continue;
 
             const cleanIndex = indexMap.get(event.index);
@@ -325,6 +326,11 @@ export async function claudeApiCallStream(
             if (event.delta?.type === 'text_delta' && contentBlocks[cleanIndex]) {
               contentBlocks[cleanIndex].text =
                 (contentBlocks[cleanIndex].text || '') + (event.delta.text || '');
+            }
+
+            if (event.delta?.type === 'thinking_delta' && contentBlocks[cleanIndex]) {
+              contentBlocks[cleanIndex].thinking =
+                (contentBlocks[cleanIndex].thinking || '') + (event.delta.thinking || '');
             }
 
             onEvent(`event: content_block_delta\ndata: ${JSON.stringify({
@@ -336,7 +342,7 @@ export async function claudeApiCallStream(
           }
 
           if (event.type === 'content_block_stop') {
-            if (thinkingBlockIndices.has(event.index)) continue;
+            if (skippedBlockIndices.has(event.index)) continue;
 
             const cleanIndex = indexMap.get(event.index);
             if (cleanIndex === undefined) continue;

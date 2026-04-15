@@ -145,6 +145,7 @@ export type StreamEvent =
   | ContentPartAddedEvent
   | OutputTextDeltaEvent
   | FunctionCallArgumentsDeltaEvent
+  | ReasoningSummaryTextDeltaEvent
   | OutputItemDoneEvent
   | ResponseCompletedEvent
   | StreamErrorEvent;
@@ -181,6 +182,14 @@ export interface FunctionCallArgumentsDeltaEvent {
   delta: string;
   item_id: string;
   output_index: number;
+}
+
+export interface ReasoningSummaryTextDeltaEvent {
+  type: 'response.reasoning_summary_text.delta';
+  delta: string;
+  item_id: string;
+  output_index: number;
+  summary_index?: number;
 }
 
 export interface OutputItemDoneEvent {

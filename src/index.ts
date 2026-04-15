@@ -23,6 +23,7 @@ export type {
   ContentPartAddedEvent,
   OutputTextDeltaEvent,
   FunctionCallArgumentsDeltaEvent,
+  ReasoningSummaryTextDeltaEvent,
   OutputItemDoneEvent,
   ResponseCompletedEvent,
   StreamErrorEvent,

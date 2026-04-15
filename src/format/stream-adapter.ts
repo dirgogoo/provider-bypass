@@ -45,16 +45,30 @@ export function createClaudeStreamAdapter(onEvent: (event: StreamEvent) => void)
           return;
         }
 
-        // content_block_start → response.output_item.added (skip thinking/signature)
+        // content_block_start → response.output_item.added
+        // (skip signature only — thinking is emitted as reasoning items)
         if (event.type === 'content_block_start') {
           const block = event.content_block;
-          if (block?.type === 'thinking' || block?.type === 'signature') {
+          if (block?.type === 'signature') {
             skippedIndices.add(event.index);
             return;
           }
 
-          const itemId = generateId('msg');
+          const itemId = generateId(block?.type === 'thinking' ? 'rs' : 'msg');
           blockIdMap.set(event.index, itemId);
+
+          if (block?.type === 'thinking') {
+            onEvent({
+              type: 'response.output_item.added',
+              item: {
+                id: itemId,
+                type: 'reasoning',
+                status: 'in_progress',
+                content: [],
+              } as any,
+              output_index: currentBlockIndex,
+            });
+          }
 
           if (block?.type === 'text') {
             onEvent({
@@ -95,7 +109,7 @@ export function createClaudeStreamAdapter(onEvent: (event: StreamEvent) => void)
           return;
         }
 
-        // content_block_delta → text delta / function call args delta
+        // content_block_delta → text / function call args / reasoning delta
         if (event.type === 'content_block_delta') {
           if (skippedIndices.has(event.index)) return;
           const itemId = blockIdMap.get(event.index) || '';
@@ -116,6 +130,16 @@ export function createClaudeStreamAdapter(onEvent: (event: StreamEvent) => void)
               delta: event.delta.partial_json,
               item_id: itemId,
               output_index: currentBlockIndex,
+            });
+          }
+
+          if (event.delta?.type === 'thinking_delta') {
+            onEvent({
+              type: 'response.reasoning_summary_text.delta',
+              delta: event.delta.thinking || '',
+              item_id: itemId,
+              output_index: currentBlockIndex,
+              summary_index: 0,
             });
           }
 
