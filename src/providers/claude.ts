@@ -1,0 +1,363 @@
+import type { ClaudeAuth } from '../auth/claude-auth.js';
+import type { Logger } from '../types.js';
+import { generateId } from '../utils/id-generator.js';
+import { Errors } from '../utils/errors.js';
+
+const DEFAULT_API_URL = 'https://api.anthropic.com/v1/messages?beta=true';
+const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
+
+export interface ClaudeMessage {
+  role: 'user' | 'assistant';
+  content: any;
+}
+
+export interface ClaudeTool {
+  name: string;
+  description: string;
+  input_schema: Record<string, any>;
+}
+
+export interface ClaudeRequestOptions {
+  model?: string;
+  max_tokens?: number;
+  temperature?: number;
+  system?: string | Array<{ type: string; text: string; cache_control?: any }>;
+  messages: ClaudeMessage[];
+  tools?: ClaudeTool[];
+  tool_choice?: any;
+  stream?: boolean;
+  timeout?: number;
+}
+
+export interface ClaudeResponse {
+  id: string;
+  type: 'message';
+  role: 'assistant';
+  content: any[];
+  model: string;
+  stop_reason: string;
+  stop_sequence: string | null;
+  usage: {
+    input_tokens: number;
+    output_tokens: number;
+    cache_creation_input_tokens?: number;
+    cache_read_input_tokens?: number;
+  };
+}
+
+function buildRequestBody(options: ClaudeRequestOptions): any {
+  let system: any[] = [];
+
+  if (options.system) {
+    if (typeof options.system === 'string') {
+      system = [{ type: 'text', text: options.system }];
+    } else if (Array.isArray(options.system)) {
+      system = [...options.system];
+    }
+  }
+
+  const body: any = {
+    model: options.model || 'claude-sonnet-4-6',
+    max_tokens: options.max_tokens || 16384,
+    stream: options.stream || false,
+    messages: options.messages,
+  };
+
+  if (system.length > 0) {
+    body.system = system;
+  }
+
+  // Enable thinking with generous budget
+  body.temperature = 1;
+  body.thinking = { type: 'enabled', budget_tokens: 16000 };
+
+  if (options.tools && options.tools.length > 0) {
+    body.tools = options.tools;
+  }
+  if (options.tool_choice) {
+    body.tool_choice = options.tool_choice;
+  }
+
+  return body;
+}
+
+/**
+ * Filter out thinking/signature blocks from response content.
+ */
+function cleanContent(content: any[]): any[] {
+  return (content || [])
+    .filter((b: any) => b.type !== 'thinking' && b.type !== 'signature')
+    .map((b: any) => {
+      const { caller, ...rest } = b;
+      return rest;
+    });
+}
+
+/**
+ * Non-streaming API call to Anthropic.
+ */
+export async function claudeApiCall(
+  auth: ClaudeAuth,
+  apiUrl: string | undefined,
+  options: ClaudeRequestOptions,
+  abortSignal?: AbortSignal,
+): Promise<{ response: ClaudeResponse; latencyMs: number }> {
+  const startTime = Date.now();
+  const headers = auth.getHeaders();
+  const body = buildRequestBody(options);
+  const timeoutMs = options.timeout || DEFAULT_TIMEOUT_MS;
+  const url = apiUrl || DEFAULT_API_URL;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  if (abortSignal) {
+    abortSignal.addEventListener('abort', () => controller.abort());
+  }
+
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+
+    const data = await res.json() as any;
+
+    if (data.type === 'error') {
+      throw Errors.apiError(`Claude API Error: ${data.error?.type} - ${data.error?.message}`);
+    }
+
+    const latencyMs = Date.now() - startTime;
+
+    const response: ClaudeResponse = {
+      id: data.id || generateId('msg'),
+      type: 'message',
+      role: 'assistant',
+      content: cleanContent(data.content),
+      model: options.model || data.model || 'claude-sonnet-4-6',
+      stop_reason: data.stop_reason || 'end_turn',
+      stop_sequence: data.stop_sequence || null,
+      usage: {
+        input_tokens: data.usage?.input_tokens || 0,
+        output_tokens: data.usage?.output_tokens || 0,
+        ...(data.usage?.cache_creation_input_tokens && {
+          cache_creation_input_tokens: data.usage.cache_creation_input_tokens,
+        }),
+        ...(data.usage?.cache_read_input_tokens && {
+          cache_read_input_tokens: data.usage.cache_read_input_tokens,
+        }),
+      },
+    };
+
+    return { response, latencyMs };
+  } catch (err: any) {
+    if (err.name === 'AbortError') {
+      throw Errors.timeout(timeoutMs / 1000);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Streaming API call to Anthropic.
+ * Filters out signature blocks, remaps content block indices.
+ */
+export async function claudeApiCallStream(
+  auth: ClaudeAuth,
+  apiUrl: string | undefined,
+  options: ClaudeRequestOptions,
+  onEvent: (event: string) => void,
+  abortSignal?: AbortSignal,
+): Promise<{ response: ClaudeResponse; latencyMs: number }> {
+  const startTime = Date.now();
+  const headers = auth.getHeaders();
+  const body = buildRequestBody({ ...options, stream: true });
+  const timeoutMs = options.timeout || DEFAULT_TIMEOUT_MS;
+  const url = apiUrl || DEFAULT_API_URL;
+
+  const controller = new AbortController();
+  let activeTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function resetTimeout() {
+    if (activeTimer) clearTimeout(activeTimer);
+    activeTimer = setTimeout(() => controller.abort(), timeoutMs);
+  }
+
+  function clearActiveTimeout() {
+    if (activeTimer) { clearTimeout(activeTimer); activeTimer = null; }
+  }
+
+  resetTimeout();
+
+  if (abortSignal) {
+    abortSignal.addEventListener('abort', () => controller.abort());
+  }
+
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+
+    if (!res.ok || !res.body) {
+      const data = await res.json() as any;
+      throw Errors.apiError(`Claude API Error: ${data.error?.type} - ${data.error?.message}`);
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let responseId = generateId('msg');
+    let stopReason = 'end_turn';
+    let inputTokens = 0;
+    let outputTokens = 0;
+
+    const thinkingBlockIndices = new Set<number>();
+    const contentBlocks: any[] = [];
+    const indexMap = new Map<number, number>();
+    let nextCleanIndex = 0;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      resetTimeout();
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+
+        const data = line.slice(6).trim();
+        if (data === '[DONE]') continue;
+
+        try {
+          const event = JSON.parse(data);
+
+          if (event.type === 'message_start' && event.message) {
+            responseId = event.message.id || responseId;
+            inputTokens = event.message.usage?.input_tokens || 0;
+            event.message.content = [];
+            delete event.message.context_management;
+            onEvent(`event: message_start\ndata: ${JSON.stringify(event)}\n\n`);
+            continue;
+          }
+
+          if (event.type === 'content_block_start') {
+            const blockType = event.content_block?.type;
+
+            if (blockType === 'signature') {
+              thinkingBlockIndices.add(event.index);
+              continue;
+            }
+
+            const cleanIndex = nextCleanIndex++;
+            indexMap.set(event.index, cleanIndex);
+
+            const { caller, ...cleanBlock } = event.content_block;
+            contentBlocks[cleanIndex] = { ...cleanBlock };
+
+            onEvent(`event: content_block_start\ndata: ${JSON.stringify({
+              type: 'content_block_start',
+              index: cleanIndex,
+              content_block: cleanBlock,
+            })}\n\n`);
+            continue;
+          }
+
+          if (event.type === 'content_block_delta') {
+            if (thinkingBlockIndices.has(event.index)) continue;
+            if (event.delta?.type === 'signature_delta') continue;
+
+            const cleanIndex = indexMap.get(event.index);
+            if (cleanIndex === undefined) continue;
+
+            if (event.delta?.type === 'text_delta' && contentBlocks[cleanIndex]) {
+              contentBlocks[cleanIndex].text =
+                (contentBlocks[cleanIndex].text || '') + (event.delta.text || '');
+            }
+
+            onEvent(`event: content_block_delta\ndata: ${JSON.stringify({
+              type: 'content_block_delta',
+              index: cleanIndex,
+              delta: event.delta,
+            })}\n\n`);
+            continue;
+          }
+
+          if (event.type === 'content_block_stop') {
+            if (thinkingBlockIndices.has(event.index)) continue;
+
+            const cleanIndex = indexMap.get(event.index);
+            if (cleanIndex === undefined) continue;
+
+            onEvent(`event: content_block_stop\ndata: ${JSON.stringify({
+              type: 'content_block_stop',
+              index: cleanIndex,
+            })}\n\n`);
+            continue;
+          }
+
+          if (event.type === 'message_delta') {
+            stopReason = event.delta?.stop_reason || stopReason;
+            outputTokens = event.usage?.output_tokens || outputTokens;
+            onEvent(`event: message_delta\ndata: ${JSON.stringify(event)}\n\n`);
+            continue;
+          }
+
+          if (event.type === 'message_stop') {
+            onEvent(`event: message_stop\ndata: ${JSON.stringify(event)}\n\n`);
+            continue;
+          }
+
+          if (event.type === 'ping') {
+            onEvent(`event: ping\ndata: ${JSON.stringify(event)}\n\n`);
+            continue;
+          }
+
+          if (event.type === 'error') {
+            onEvent(`event: error\ndata: ${JSON.stringify(event)}\n\n`);
+            continue;
+          }
+
+        } catch {
+          // Skip unparseable
+        }
+      }
+    }
+
+    const latencyMs = Date.now() - startTime;
+
+    const response: ClaudeResponse = {
+      id: responseId,
+      type: 'message',
+      role: 'assistant',
+      content: contentBlocks.filter(Boolean),
+      model: options.model || 'claude-sonnet-4-6',
+      stop_reason: stopReason,
+      stop_sequence: null,
+      usage: { input_tokens: inputTokens, output_tokens: outputTokens },
+    };
+
+    return { response, latencyMs };
+  } catch (err: any) {
+    if (err.name === 'AbortError') {
+      onEvent(`event: error\ndata: ${JSON.stringify({
+        type: 'error',
+        error: { type: 'timeout_error', message: `Request timed out after ${timeoutMs / 1000}s` },
+      })}\n\n`);
+      throw Errors.timeout(timeoutMs / 1000);
+    }
+    throw err;
+  } finally {
+    clearActiveTimeout();
+  }
+}
