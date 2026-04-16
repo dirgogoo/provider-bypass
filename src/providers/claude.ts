@@ -50,6 +50,18 @@ export interface ClaudeResponse {
 // a misleading HTTP 429 rate_limit_error even when quota is fine.
 const CLAUDE_CODE_IDENTIFIER = "You are Claude Code, Anthropic's official CLI for Claude.";
 
+// Per-model output ceiling (mirrors Claude Code's getModelMaxOutputTokens).
+// Thinking budget can go up to maxOutputTokens; we reserve 1024 for the answer.
+function getModelMaxOutput(model: string): number {
+  const m = model.toLowerCase();
+  if (m.includes('opus-4-7') || m.includes('opus-4-6') || m.includes('sonnet-4-6')) return 128_000;
+  if (m.includes('opus-4-5') || m.includes('sonnet-4') || m.includes('haiku-4') || m.includes('3-7-sonnet')) return 64_000;
+  if (m.includes('opus-4-1') || m.includes('opus-4')) return 32_000;
+  if (m.includes('claude-3-opus') || m.includes('claude-3-haiku')) return 4_096;
+  if (m.includes('claude-3-sonnet') || m.includes('3-5-sonnet') || m.includes('3-5-haiku')) return 8_192;
+  return 64_000;
+}
+
 function buildRequestBody(options: ClaudeRequestOptions): any {
   let userSystem: any[] = [];
 
@@ -70,11 +82,14 @@ function buildRequestBody(options: ClaudeRequestOptions): any {
     ? userSystem
     : [{ type: 'text', text: CLAUDE_CODE_IDENTIFIER }, ...userSystem];
 
-  const thinkingBudget = 16000;
-  const maxTokens = options.max_tokens || 16384;
+  const model = options.model || 'claude-sonnet-4-6';
+  const modelMaxOutput = getModelMaxOutput(model);
+  // Reserve ~1k for the actual answer; the rest is available for thinking.
+  const thinkingBudget = Math.max(modelMaxOutput - 1024, 1024);
+  const maxTokens = options.max_tokens || modelMaxOutput;
 
   const body: any = {
-    model: options.model || 'claude-sonnet-4-6',
+    model,
     stream: options.stream || false,
     messages: options.messages,
     system,
@@ -83,12 +98,12 @@ function buildRequestBody(options: ClaudeRequestOptions): any {
   if (options.temperature !== undefined) {
     // User set temperature explicitly — no thinking
     body.temperature = options.temperature;
-    body.max_tokens = maxTokens;
+    body.max_tokens = Math.min(maxTokens, modelMaxOutput);
   } else {
     // Enable thinking by default (requires temperature=1, max_tokens > budget_tokens)
     body.temperature = 1;
     body.thinking = { type: 'enabled', budget_tokens: thinkingBudget };
-    body.max_tokens = Math.max(maxTokens, thinkingBudget + 1024);
+    body.max_tokens = Math.min(Math.max(maxTokens, thinkingBudget + 1024), modelMaxOutput);
   }
 
   if (options.tools && options.tools.length > 0) {
