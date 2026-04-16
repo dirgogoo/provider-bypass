@@ -106,6 +106,30 @@ ai.presets.create({
 const tools = ai.presets.getTools('devops')
 ```
 
+### Prompt Caching (Claude)
+
+Automatic Anthropic prompt caching is **enabled by default** for Claude models. On every request the library injects `cache_control: { type: 'ephemeral' }` on:
+
+1. the last `system` block (covers system prompt)
+2. the last `tool` definition (covers tools list)
+3. the last content block of the last message (rolling conversation breakpoint)
+
+Cache reads cost ~10% of normal input tokens; writes cost ~125%. For multi-turn agentic loops this typically cuts input cost by **60–75%** with zero configuration.
+
+Disable per-request:
+
+```typescript
+await ai.send({
+  model: 'claude-opus-4-7',
+  input: [...],
+  cache: 'none',   // default: 'auto'
+})
+```
+
+If the caller already sets `cache_control` on any system/tools/message block, the library **does not** inject additional breakpoints — explicit caller intent always wins. Codex/OpenAI models ignore this flag (OpenAI does automatic prompt caching server-side).
+
+Inspect `response.usage.cache_read_input_tokens` and `cache_creation_input_tokens` to verify.
+
 ## Configuration
 
 ```typescript

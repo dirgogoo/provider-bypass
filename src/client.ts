@@ -128,6 +128,7 @@ export class ProviderBypass {
         messages,
         tools: claudeTools,
         tool_choice: claudeToolChoice,
+        cache: request.cache,
         timeout,
       }, request.signal),
     );
@@ -182,6 +183,7 @@ export class ProviderBypass {
         messages,
         tools: claudeTools,
         tool_choice: claudeToolChoice,
+        cache: request.cache,
         timeout,
       }, adapter.onRawEvent, request.signal),
     ).then((result) => {

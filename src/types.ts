@@ -50,6 +50,14 @@ export interface SendRequest {
   signal?: AbortSignal;
   /** Per-request timeout override (ms) */
   timeout?: number;
+  /**
+   * Anthropic prompt caching strategy (Claude models only, no-op on Codex).
+   * - 'auto' (default): automatically marks `cache_control` on the last system
+   *   block, last tool, and last message content block (up to 3 breakpoints).
+   *   Respects any `cache_control` the caller already set.
+   * - 'none': disables automatic cache_control injection.
+   */
+  cache?: 'auto' | 'none';
 }
 
 export type InputItem =

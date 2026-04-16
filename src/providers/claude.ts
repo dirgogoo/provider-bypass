@@ -15,6 +15,7 @@ export interface ClaudeTool {
   name: string;
   description: string;
   input_schema: Record<string, any>;
+  cache_control?: { type: 'ephemeral' };
 }
 
 export interface ClaudeRequestOptions {
@@ -27,6 +28,8 @@ export interface ClaudeRequestOptions {
   tool_choice?: any;
   stream?: boolean;
   timeout?: number;
+  /** Auto-inject cache_control on system/tools/last-message. Default 'auto'. */
+  cache?: 'auto' | 'none';
 }
 
 export interface ClaudeResponse {
@@ -62,7 +65,58 @@ function getModelMaxOutput(model: string): number {
   return 64_000;
 }
 
+const EPHEMERAL: { type: 'ephemeral' } = { type: 'ephemeral' };
+
+/**
+ * Apply cache_control: { type: 'ephemeral' } to the last block in an array,
+ * without mutating the input. If any block already has cache_control, the
+ * caller is assumed to manage breakpoints explicitly and we skip injection.
+ */
+function markLastWithCache<T extends Record<string, any>>(arr: T[]): T[] {
+  if (!arr.length) return arr;
+  if (arr.some((b) => b && b.cache_control)) return arr;
+  const last = arr[arr.length - 1];
+  return [...arr.slice(0, -1), { ...last, cache_control: EPHEMERAL }];
+}
+
+/**
+ * Attach cache_control to the last content block of the last message, so the
+ * evolving conversation prefix is cached turn-to-turn. Uses a "rolling
+ * breakpoint": on turn N+1 the last-block marker moves, but Anthropic still
+ * matches cache hits at earlier breakpoint boundaries automatically.
+ *
+ * Handles string vs array content; returns a new messages array (no mutation).
+ */
+function markLastMessageWithCache(messages: ClaudeMessage[]): ClaudeMessage[] {
+  if (!messages.length) return messages;
+  const lastIdx = messages.length - 1;
+  const last = messages[lastIdx];
+  let newContent: any;
+
+  if (typeof last.content === 'string') {
+    if (!last.content) return messages;
+    newContent = [{ type: 'text', text: last.content, cache_control: EPHEMERAL }];
+  } else if (Array.isArray(last.content)) {
+    if (!last.content.length) return messages;
+    // If caller already marked anything, don't override.
+    if (last.content.some((b: any) => b && b.cache_control)) return messages;
+    const lastBlockIdx = last.content.length - 1;
+    const lastBlock = last.content[lastBlockIdx];
+    if (!lastBlock || typeof lastBlock !== 'object') return messages;
+    newContent = [
+      ...last.content.slice(0, -1),
+      { ...lastBlock, cache_control: EPHEMERAL },
+    ];
+  } else {
+    return messages;
+  }
+
+  return [...messages.slice(0, -1), { ...last, content: newContent }];
+}
+
 function buildRequestBody(options: ClaudeRequestOptions): any {
+  const cacheEnabled = options.cache !== 'none';
+
   let userSystem: any[] = [];
 
   if (options.system) {
@@ -78,9 +132,11 @@ function buildRequestBody(options: ClaudeRequestOptions): any {
   const alreadyPresent = typeof userSystem[0]?.text === 'string'
     && userSystem[0].text.startsWith(CLAUDE_CODE_IDENTIFIER);
 
-  const system = alreadyPresent
+  let system = alreadyPresent
     ? userSystem
     : [{ type: 'text', text: CLAUDE_CODE_IDENTIFIER }, ...userSystem];
+
+  if (cacheEnabled) system = markLastWithCache(system);
 
   const model = options.model || 'claude-sonnet-4-6';
   const modelMaxOutput = getModelMaxOutput(model);
@@ -88,10 +144,14 @@ function buildRequestBody(options: ClaudeRequestOptions): any {
   const thinkingBudget = Math.max(modelMaxOutput - 1024, 1024);
   const maxTokens = options.max_tokens || modelMaxOutput;
 
+  const messages = cacheEnabled
+    ? markLastMessageWithCache(options.messages)
+    : options.messages;
+
   const body: any = {
     model,
     stream: options.stream || false,
-    messages: options.messages,
+    messages,
     system,
   };
 
@@ -107,7 +167,7 @@ function buildRequestBody(options: ClaudeRequestOptions): any {
   }
 
   if (options.tools && options.tools.length > 0) {
-    body.tools = options.tools;
+    body.tools = cacheEnabled ? markLastWithCache(options.tools) : options.tools;
   }
   if (options.tool_choice) {
     body.tool_choice = options.tool_choice;
@@ -275,6 +335,8 @@ export async function claudeApiCallStream(
     let stopReason = 'end_turn';
     let inputTokens = 0;
     let outputTokens = 0;
+    let cacheCreationTokens = 0;
+    let cacheReadTokens = 0;
 
     const skippedBlockIndices = new Set<number>(); // signature blocks only
     const contentBlocks: any[] = [];
@@ -303,6 +365,10 @@ export async function claudeApiCallStream(
           if (event.type === 'message_start' && event.message) {
             responseId = event.message.id || responseId;
             inputTokens = event.message.usage?.input_tokens || 0;
+            cacheCreationTokens =
+              event.message.usage?.cache_creation_input_tokens || 0;
+            cacheReadTokens =
+              event.message.usage?.cache_read_input_tokens || 0;
             event.message.content = [];
             delete event.message.context_management;
             onEvent(`event: message_start\ndata: ${JSON.stringify(event)}\n\n`);
@@ -407,7 +473,12 @@ export async function claudeApiCallStream(
       model: options.model || 'claude-sonnet-4-6',
       stop_reason: stopReason,
       stop_sequence: null,
-      usage: { input_tokens: inputTokens, output_tokens: outputTokens },
+      usage: {
+        input_tokens: inputTokens,
+        output_tokens: outputTokens,
+        ...(cacheCreationTokens && { cache_creation_input_tokens: cacheCreationTokens }),
+        ...(cacheReadTokens && { cache_read_input_tokens: cacheReadTokens }),
+      },
     };
 
     return { response, latencyMs };
