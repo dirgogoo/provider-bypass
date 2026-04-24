@@ -21,6 +21,7 @@ import { PresetRegistry } from './tools/presets.js';
 import { createRequestQueue, getQueueStats } from './queue/request-queue.js';
 import { createDefaultLogger } from './utils/logger.js';
 import { Errors } from './utils/errors.js';
+import { randomUUID } from 'node:crypto';
 
 export class ProviderBypass {
   private readonly claudeAuth: ClaudeAuth;
@@ -32,6 +33,11 @@ export class ProviderBypass {
   private readonly concurrency: number;
   private readonly claudeApiUrl: string | undefined;
   private readonly codexApiUrl: string | undefined;
+  /**
+   * Session UUID reused as `prompt_cache_key` on every Codex request.
+   * Consecutive turns with the same UUID reuse cached prefix tokens (24h TTL).
+   */
+  private readonly codexSessionId: string;
 
   readonly tools: ToolRegistry;
   readonly presets: PresetRegistry;
@@ -43,6 +49,7 @@ export class ProviderBypass {
     this.concurrency = options.concurrency ?? 3;
     this.claudeApiUrl = options.claude?.apiUrl;
     this.codexApiUrl = options.codex?.apiUrl;
+    this.codexSessionId = options.codex?.sessionId || randomUUID();
 
     this.claudeAuth = new ClaudeAuth(options.claude, this.logger);
     this.codexAuth = new CodexAuth(options.codex, this.logger);
@@ -262,6 +269,7 @@ export class ProviderBypass {
         max_output_tokens: request.max_output_tokens,
         reasoning: request.reasoning,
         timeout,
+        sessionId: this.codexSessionId,
       }, request.signal),
     );
 
@@ -302,6 +310,7 @@ export class ProviderBypass {
         max_output_tokens: request.max_output_tokens,
         reasoning: request.reasoning,
         timeout,
+        sessionId: this.codexSessionId,
       }, (rawEvent) => {
         const parsed = parseCodexStreamEvent(rawEvent);
         if (!parsed) return;

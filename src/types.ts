@@ -19,7 +19,15 @@ export interface ClientOptions {
   codex?: {
     credentialPath?: string;
     refreshCommand?: string;
+    /** WebSocket URL override. Default: wss://chatgpt.com/backend-api/codex/responses */
     apiUrl?: string;
+    /**
+     * Session UUID. Used as `prompt_cache_key` on every request from this
+     * client instance — consecutive turns with the same UUID can reuse
+     * cached prefix tokens (24h TTL). If omitted, a fresh UUID is generated
+     * on construction and reused for the lifetime of the client.
+     */
+    sessionId?: string;
   };
 }
 
@@ -141,8 +149,14 @@ export interface Usage {
   input_tokens: number;
   output_tokens: number;
   total_tokens: number;
+  /** Anthropic-style cache write tokens (Claude only). */
   cache_creation_input_tokens?: number;
+  /** Anthropic-style cache read tokens (Claude only). */
   cache_read_input_tokens?: number;
+  /** OpenAI-style prompt cache hit (Codex only, mirrors input_tokens_details.cached_tokens). */
+  cached_tokens?: number;
+  /** Reasoning tokens (subset of output_tokens, reasoning models only). */
+  reasoning_tokens?: number;
 }
 
 // ─── Streaming ───

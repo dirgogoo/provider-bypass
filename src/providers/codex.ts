@@ -1,9 +1,14 @@
+import WebSocket from 'ws';
 import type { CodexAuth } from '../auth/codex-auth.js';
 import { generateId } from '../utils/id-generator.js';
+import { getInstallationId } from '../utils/installation-id.js';
 import { Errors } from '../utils/errors.js';
 
-const DEFAULT_API_URL = 'https://chatgpt.com/backend-api/codex/responses';
+const DEFAULT_WS_URL = 'wss://chatgpt.com/backend-api/codex/responses';
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
+const RESPONSES_BETA = 'responses_websockets=2026-02-06';
+const CODEX_VERSION = '0.124.0';
+const ORIGINATOR = 'codex_exec';
 
 export interface CodexRequestOptions {
   model?: string;
@@ -16,6 +21,18 @@ export interface CodexRequestOptions {
   max_output_tokens?: number;
   reasoning?: { summary?: string; effort?: string };
   timeout?: number;
+  /** Session UUID reused across calls → stable prompt_cache_key → cache hits. */
+  sessionId?: string;
+}
+
+export interface CodexUsage {
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  /** Tokens served from prompt cache (0 when cache miss). */
+  cached_tokens?: number;
+  /** Reasoning tokens (subset of output_tokens for reasoning models). */
+  reasoning_tokens?: number;
 }
 
 export interface CodexResponse {
@@ -24,11 +41,7 @@ export interface CodexResponse {
   model: string;
   output: any[];
   status: string;
-  usage: {
-    input_tokens: number;
-    output_tokens: number;
-    total_tokens: number;
-  };
+  usage: CodexUsage;
 }
 
 const REASONING_MODEL_RE = /^(gpt-5|o1|o3|o4)/i;
@@ -36,56 +49,79 @@ const DEFAULT_REASONING_EFFORT = 'xhigh';
 const DEFAULT_REASONING_SUMMARY = 'auto';
 
 /**
- * ChatGPT backend always requires stream=true and store=false.
+ * Build the WebSocket request frame (`type: "response.create"`).
  *
- * For reasoning models (gpt-5.x, o1, o3, o4), we default `reasoning` to
- * `{ effort: "xhigh", summary: "auto" }` when caller did not set them:
- * - `effort: xhigh` maximizes reasoning depth (parity with Claude's
- *   maximized thinking budget).
- * - `summary: auto` keeps the SSE stream alive during long reasoning
- *   phases — without it, edge proxies drop idle connections at ~60-100s,
- *   surfacing as `terminated` errors mid-turn.
- *
- * Explicit caller values always win.
+ * Reproduces the payload shape captured from codex-cli v0.124.0:
+ * the same fields, in the same order, with `prompt_cache_key` set to
+ * the caller's session UUID so that consecutive turns can reuse cached
+ * prefix tokens (observed ~19% cache hit on the second turn, growing
+ * as the conversation gets longer).
  */
-function buildRequestBody(options: CodexRequestOptions): any {
+function buildFrame(options: CodexRequestOptions, sessionId: string): Record<string, any> {
   const model = options.model || 'gpt-5.4';
-  const body: any = {
+  const isReasoning = REASONING_MODEL_RE.test(model);
+
+  const reasoning = isReasoning
+    ? {
+        effort: options.reasoning?.effort ?? DEFAULT_REASONING_EFFORT,
+        summary: options.reasoning?.summary ?? DEFAULT_REASONING_SUMMARY,
+        ...options.reasoning,
+      }
+    : options.reasoning
+    ? { ...options.reasoning }
+    : undefined;
+
+  const frame: Record<string, any> = {
+    type: 'response.create',
     model,
+    instructions: options.instructions || 'You are a helpful assistant.',
     input: options.input,
-    stream: true,
     store: false,
+    stream: true,
+    include: ['reasoning.encrypted_content'],
+    prompt_cache_key: sessionId,
+    text: { verbosity: 'low' },
+    client_metadata: {
+      'x-codex-window-id': `${sessionId}:0`,
+      'x-codex-installation-id': getInstallationId(),
+      'x-codex-turn-metadata': JSON.stringify({
+        session_id: sessionId,
+        thread_source: 'user',
+        turn_id: '',
+        workspaces: {},
+        sandbox: 'none',
+      }),
+    },
   };
 
-  body.instructions = options.instructions || 'You are a helpful assistant.';
-
-  // ChatGPT backend does not support max_output_tokens
-  if (options.temperature !== undefined) body.temperature = options.temperature;
-
-  const isReasoningModel = REASONING_MODEL_RE.test(model);
-  if (isReasoningModel) {
-    const incoming = options.reasoning || {};
-    body.reasoning = {
-      ...incoming,
-      effort: incoming.effort ?? DEFAULT_REASONING_EFFORT,
-      summary: incoming.summary ?? DEFAULT_REASONING_SUMMARY,
-    };
-  } else if (options.reasoning) {
-    body.reasoning = { ...options.reasoning };
-  }
-
+  if (reasoning) frame.reasoning = reasoning;
+  if (options.temperature !== undefined) frame.temperature = options.temperature;
   if (options.tools && options.tools.length > 0) {
-    body.tools = options.tools;
-    body.tool_choice = options.tool_choice || 'auto';
-    body.parallel_tool_calls = options.parallel_tool_calls ?? true;
+    frame.tools = options.tools;
+    frame.tool_choice = options.tool_choice || 'auto';
+    frame.parallel_tool_calls = options.parallel_tool_calls ?? true;
   }
 
-  return body;
+  return frame;
+}
+
+function buildHandshakeHeaders(accessToken: string, accountId: string | undefined, sessionId: string): Record<string, string> {
+  const headers: Record<string, string> = {
+    'Authorization': `Bearer ${accessToken}`,
+    'openai-beta': RESPONSES_BETA,
+    'x-codex-window-id': `${sessionId}:0`,
+    'x-client-request-id': sessionId,
+    'session_id': sessionId,
+    'originator': ORIGINATOR,
+    'version': CODEX_VERSION,
+    'User-Agent': `codex_exec/${CODEX_VERSION}`,
+  };
+  if (accountId) headers['chatgpt-account-id'] = accountId;
+  return headers;
 }
 
 /**
- * Non-streaming API call. Internally streams (ChatGPT backend requirement)
- * but collects the full response before returning.
+ * Non-streaming API call. Internally streams and collects the full response.
  */
 export async function codexApiCall(
   auth: CodexAuth,
@@ -97,8 +133,15 @@ export async function codexApiCall(
 }
 
 /**
- * Streaming API call to OpenAI/Codex.
- * Parses SSE events and forwards them to the callback.
+ * Streaming API call to OpenAI/Codex over WebSocket.
+ *
+ * The Codex backend is WebSocket-only since v0.124.0. The HTTP POST
+ * variant silently disables prompt caching (backend overrides the
+ * caller's `prompt_cache_key` with a per-request UUID). The WS variant
+ * honors the key, enabling cross-turn cache reuse.
+ *
+ * `onEvent` receives raw SSE-formatted strings (`event: <type>\ndata: <json>\n\n`)
+ * for back-compat with the old transport and the stream-adapter.
  */
 export async function codexApiCallStream(
   auth: CodexAuth,
@@ -107,129 +150,176 @@ export async function codexApiCallStream(
   onEvent: (event: string) => void,
   abortSignal?: AbortSignal,
 ): Promise<{ response: CodexResponse; latencyMs: number }> {
-  const startTime = Date.now();
-  const headers = auth.getHeaders();
-  const body = buildRequestBody(options);
+  const creds = auth.getCredentials();
+  const sessionId = options.sessionId || generateSessionUuid();
   const timeoutMs = options.timeout || DEFAULT_TIMEOUT_MS;
-  const url = apiUrl || DEFAULT_API_URL;
+  const url = apiUrl || DEFAULT_WS_URL;
 
-  const controller = new AbortController();
-  let activeTimer: ReturnType<typeof setTimeout> | null = null;
+  const headers = buildHandshakeHeaders(creds.accessToken, creds.accountId, sessionId);
+  const frame = buildFrame(options, sessionId);
 
-  function resetTimeout() {
-    if (activeTimer) clearTimeout(activeTimer);
-    activeTimer = setTimeout(() => controller.abort(), timeoutMs);
-  }
+  const startedAt = Date.now();
+  let model = options.model || 'gpt-5.4';
+  let responseId = generateId('msg');
+  let status = 'completed';
+  let usage: CodexUsage = { input_tokens: 0, output_tokens: 0, total_tokens: 0 };
+  const outputBlocks: any[] = [];
 
-  function clearActiveTimeout() {
-    if (activeTimer) { clearTimeout(activeTimer); activeTimer = null; }
-  }
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(url, { headers });
 
-  resetTimeout();
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
 
-  const onAbort = () => controller.abort();
-  if (abortSignal) {
-    abortSignal.addEventListener('abort', onAbort, { once: true });
-  }
-
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
-
-    if (!res.ok || !res.body) {
-      let errMsg: string;
-      try {
-        const data = await res.json() as any;
-        errMsg = data.error?.message || data.error?.type || JSON.stringify(data);
-      } catch {
-        errMsg = await res.text().catch(() => 'unknown');
+    const cleanup = () => {
+      if (timer) { clearTimeout(timer); timer = null; }
+      if (abortSignal) abortSignal.removeEventListener('abort', onAbort);
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        try { ws.close(); } catch { /* ignore */ }
       }
-      throw Errors.apiError(`Codex API Error (${res.status}): ${errMsg}`);
-    }
-
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    let responseId = generateId('msg');
-    let model = options.model || 'gpt-5.4';
-    let status = 'completed';
-    let inputTokens = 0;
-    let outputTokens = 0;
-    const outputBlocks: any[] = [];
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      resetTimeout();
-
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
-
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-
-        const data = line.slice(6).trim();
-        if (data === '[DONE]') continue;
-
-        try {
-          const event = JSON.parse(data);
-
-          if (event.type === 'response.created' || event.type === 'response.completed') {
-            if (event.response) {
-              responseId = event.response.id || responseId;
-              model = event.response.model || model;
-              status = event.response.status || status;
-              if (event.response.usage) {
-                inputTokens = event.response.usage.input_tokens || inputTokens;
-                outputTokens = event.response.usage.output_tokens || outputTokens;
-              }
-            }
-          }
-
-          if (event.type === 'response.output_item.done' && event.item) {
-            outputBlocks.push(event.item);
-          }
-
-          onEvent(`event: ${event.type || 'message'}\ndata: ${JSON.stringify(event)}\n\n`);
-        } catch {
-          // Skip unparseable
-        }
-      }
-    }
-
-    const latencyMs = Date.now() - startTime;
-
-    const response: CodexResponse = {
-      id: responseId,
-      object: 'response',
-      model,
-      output: outputBlocks,
-      status,
-      usage: {
-        input_tokens: inputTokens,
-        output_tokens: outputTokens,
-        total_tokens: inputTokens + outputTokens,
-      },
     };
 
-    return { response, latencyMs };
-  } catch (err: any) {
-    if (err.name === 'AbortError') {
-      onEvent(`event: error\ndata: ${JSON.stringify({
-        type: 'error',
-        error: { type: 'timeout_error', message: `Request timed out after ${timeoutMs / 1000}s` },
-      })}\n\n`);
-      throw Errors.timeout(timeoutMs / 1000);
+    const resetTimer = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        onEvent(`event: error\ndata: ${JSON.stringify({
+          type: 'error',
+          error: { type: 'timeout_error', message: `Request timed out after ${timeoutMs / 1000}s` },
+        })}\n\n`);
+        reject(Errors.timeout(timeoutMs / 1000));
+      }, timeoutMs);
+    };
+
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(new Error('Request aborted'));
+    };
+    if (abortSignal) {
+      if (abortSignal.aborted) {
+        ws.terminate();
+        return reject(new Error('Request aborted'));
+      }
+      abortSignal.addEventListener('abort', onAbort, { once: true });
     }
-    throw err;
-  } finally {
-    clearActiveTimeout();
-    abortSignal?.removeEventListener('abort', onAbort);
-  }
+
+    resetTimer();
+
+    ws.on('open', () => {
+      try {
+        ws.send(JSON.stringify(frame));
+      } catch (err: any) {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(Errors.apiError(`Codex WS send failed: ${err?.message || err}`));
+      }
+    });
+
+    ws.on('message', (data) => {
+      if (settled) return;
+      resetTimer();
+
+      let event: any;
+      try {
+        event = JSON.parse(data.toString('utf-8'));
+      } catch {
+        return; // skip unparseable
+      }
+
+      // Forward to caller in SSE format (back-compat with parseCodexStreamEvent)
+      onEvent(`event: ${event.type || 'message'}\ndata: ${JSON.stringify(event)}\n\n`);
+
+      // Track state for final response
+      if (event.type === 'response.created' || event.type === 'response.completed') {
+        if (event.response) {
+          responseId = event.response.id || responseId;
+          model = event.response.model || model;
+          status = event.response.status || status;
+          if (event.response.usage) {
+            usage = extractUsage(event.response.usage);
+          }
+        }
+      }
+
+      if (event.type === 'response.output_item.done' && event.item) {
+        outputBlocks.push(event.item);
+      }
+
+      if (event.type === 'response.completed') {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        const latencyMs = Date.now() - startedAt;
+        resolve({
+          response: {
+            id: responseId,
+            object: 'response',
+            model,
+            output: outputBlocks,
+            status,
+            usage,
+          },
+          latencyMs,
+        });
+      }
+    });
+
+    ws.on('error', (err) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(Errors.apiError(`Codex WS error: ${err?.message || err}`));
+    });
+
+    ws.on('close', (code, reason) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      const detail = reason?.toString('utf-8') || '';
+      reject(Errors.apiError(`Codex WS closed (${code})${detail ? `: ${detail}` : ''}`));
+    });
+
+    // Capture handshake HTTP failures explicitly (401, 403, 429 from upgrade)
+    ws.on('unexpected-response', (_req, res) => {
+      if (settled) return;
+      settled = true;
+      let body = '';
+      res.on('data', (chunk: Buffer) => { body += chunk.toString('utf-8'); });
+      res.on('end', () => {
+        cleanup();
+        reject(Errors.apiError(`Codex WS handshake failed (${res.statusCode}): ${body.slice(0, 400)}`));
+      });
+      res.on('error', () => {
+        cleanup();
+        reject(Errors.apiError(`Codex WS handshake failed (${res.statusCode})`));
+      });
+    });
+  });
+}
+
+function extractUsage(raw: any): CodexUsage {
+  const input = raw?.input_tokens || 0;
+  const output = raw?.output_tokens || 0;
+  const cached = raw?.input_tokens_details?.cached_tokens;
+  const reasoning = raw?.output_tokens_details?.reasoning_tokens;
+  return {
+    input_tokens: input,
+    output_tokens: output,
+    total_tokens: raw?.total_tokens || input + output,
+    ...(typeof cached === 'number' ? { cached_tokens: cached } : {}),
+    ...(typeof reasoning === 'number' ? { reasoning_tokens: reasoning } : {}),
+  };
+}
+
+function generateSessionUuid(): string {
+  // Fallback when caller didn't supply sessionId. Each call gets a fresh UUID;
+  // cache won't hit across calls unless the caller reuses sessionId explicitly.
+  return globalThis.crypto?.randomUUID
+    ? globalThis.crypto.randomUUID()
+    : require('node:crypto').randomUUID();
 }
