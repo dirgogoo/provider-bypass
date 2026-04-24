@@ -9,6 +9,15 @@ const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 const RESPONSES_BETA = 'responses_websockets=2026-02-06';
 const CODEX_VERSION = '0.124.0';
 const ORIGINATOR = 'codex_exec';
+/**
+ * Client-initiated ping interval. Cloudflare and many edges close "idle"
+ * WebSockets after ~60-100s of silence; during a long reasoning turn the
+ * server is thinking but emits no deltas. Pinging keeps the connection
+ * classified as active and prevents code 1006 closures mid-turn.
+ */
+const HEARTBEAT_INTERVAL_MS = 30_000;
+/** If no pong arrives within this window since the last ping, consider the connection dead. */
+const HEARTBEAT_DEAD_AFTER_MS = 90_000;
 
 export interface CodexRequestOptions {
   model?: string;
@@ -170,6 +179,8 @@ export async function codexApiCallStream(
 
     let settled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
+    let heartbeat: ReturnType<typeof setInterval> | null = null;
+    let lastPongAt = Date.now();
 
     // One-shot settle helper — runs fn once, cleans up timers/listeners/ws.
     // IMPORTANT: install ws event handlers BEFORE any code path that could
@@ -179,6 +190,7 @@ export async function codexApiCallStream(
       if (settled) return;
       settled = true;
       if (timer) { clearTimeout(timer); timer = null; }
+      if (heartbeat) { clearInterval(heartbeat); heartbeat = null; }
       if (abortSignal) abortSignal.removeEventListener('abort', onAbort);
       if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
         try { ws.close(); } catch { /* ignore */ }
@@ -206,12 +218,28 @@ export async function codexApiCallStream(
       res.on('error', () => settle(() => reject(Errors.apiError(`Codex WS handshake failed (${res.statusCode})`))));
     });
 
+    // Server-initiated pong resets the liveness watchdog.
+    ws.on('pong', () => { lastPongAt = Date.now(); });
+
     ws.on('open', () => {
       try {
         ws.send(JSON.stringify(frame));
       } catch (err: any) {
         settle(() => reject(Errors.apiError(`Codex WS send failed: ${err?.message || err}`)));
+        return;
       }
+      // Start heartbeat after the first frame is sent. Cloudflare treats any
+      // control frame as activity, so a periodic ping keeps the connection
+      // open during long reasoning turns that otherwise look "idle" upstream.
+      lastPongAt = Date.now();
+      heartbeat = setInterval(() => {
+        if (settled) return;
+        if (Date.now() - lastPongAt > HEARTBEAT_DEAD_AFTER_MS) {
+          settle(() => reject(Errors.apiError(`Codex WS closed (heartbeat timeout, no pong for ${Math.round(HEARTBEAT_DEAD_AFTER_MS / 1000)}s)`)));
+          return;
+        }
+        try { ws.ping(); } catch { /* ignore — settle path handles close */ }
+      }, HEARTBEAT_INTERVAL_MS);
     });
 
     ws.on('message', (data) => {
