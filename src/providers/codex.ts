@@ -31,12 +31,21 @@ export interface CodexResponse {
   };
 }
 
+const REASONING_MODEL_RE = /^(gpt-5|o1|o3|o4)/i;
+
 /**
  * ChatGPT backend always requires stream=true and store=false.
+ *
+ * For reasoning models (gpt-5.x, o1, o3, o4), we default `reasoning.summary`
+ * to "auto" when the caller did not set it. Without a summary, long reasoning
+ * phases emit no SSE events and edge proxies (Cloudflare etc.) drop the
+ * connection after ~60-100s idle — surfacing as `terminated` errors mid-turn.
+ * Summary="auto" keeps the stream alive with periodic partial outputs.
  */
 function buildRequestBody(options: CodexRequestOptions): any {
+  const model = options.model || 'gpt-5.4';
   const body: any = {
-    model: options.model || 'gpt-5.4',
+    model,
     input: options.input,
     stream: true,
     store: false,
@@ -46,7 +55,16 @@ function buildRequestBody(options: CodexRequestOptions): any {
 
   // ChatGPT backend does not support max_output_tokens
   if (options.temperature !== undefined) body.temperature = options.temperature;
-  if (options.reasoning) body.reasoning = options.reasoning;
+
+  const isReasoningModel = REASONING_MODEL_RE.test(model);
+  if (options.reasoning) {
+    body.reasoning = { ...options.reasoning };
+    if (isReasoningModel && !body.reasoning.summary) {
+      body.reasoning.summary = 'auto';
+    }
+  } else if (isReasoningModel) {
+    body.reasoning = { summary: 'auto' };
+  }
 
   if (options.tools && options.tools.length > 0) {
     body.tools = options.tools;
