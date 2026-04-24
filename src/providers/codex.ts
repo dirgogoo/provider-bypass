@@ -171,52 +171,46 @@ export async function codexApiCallStream(
     let settled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
 
-    const cleanup = () => {
+    // One-shot settle helper — runs fn once, cleans up timers/listeners/ws.
+    // IMPORTANT: install ws event handlers BEFORE any code path that could
+    // close/terminate the socket (otherwise ws emits 'error' during CONNECTING
+    // with no listener and Node crashes with unhandled event).
+    const settle = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
       if (timer) { clearTimeout(timer); timer = null; }
       if (abortSignal) abortSignal.removeEventListener('abort', onAbort);
       if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
         try { ws.close(); } catch { /* ignore */ }
       }
+      fn();
     };
 
-    const resetTimer = () => {
-      if (timer) clearTimeout(timer);
-      timer = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        onEvent(`event: error\ndata: ${JSON.stringify({
-          type: 'error',
-          error: { type: 'timeout_error', message: `Request timed out after ${timeoutMs / 1000}s` },
-        })}\n\n`);
-        reject(Errors.timeout(timeoutMs / 1000));
-      }, timeoutMs);
-    };
+    const onAbort = () => settle(() => reject(new Error('Request aborted')));
 
-    const onAbort = () => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      reject(new Error('Request aborted'));
-    };
-    if (abortSignal) {
-      if (abortSignal.aborted) {
-        ws.terminate();
-        return reject(new Error('Request aborted'));
-      }
-      abortSignal.addEventListener('abort', onAbort, { once: true });
-    }
+    // ─── Handlers first — before any abort/close that could fire 'error' ───
+    ws.on('error', (err: any) => {
+      settle(() => reject(Errors.apiError(`Codex WS error: ${err?.message || err}`)));
+    });
 
-    resetTimer();
+    ws.on('close', (code: number, reason: Buffer) => {
+      const detail = reason?.toString('utf-8') || '';
+      settle(() => reject(Errors.apiError(`Codex WS closed (${code})${detail ? `: ${detail}` : ''}`)));
+    });
+
+    // Handshake HTTP failures (401, 403, 429 from upgrade)
+    ws.on('unexpected-response', (_req, res) => {
+      let body = '';
+      res.on('data', (chunk: Buffer) => { body += chunk.toString('utf-8'); });
+      res.on('end', () => settle(() => reject(Errors.apiError(`Codex WS handshake failed (${res.statusCode}): ${body.slice(0, 400)}`))));
+      res.on('error', () => settle(() => reject(Errors.apiError(`Codex WS handshake failed (${res.statusCode})`))));
+    });
 
     ws.on('open', () => {
       try {
         ws.send(JSON.stringify(frame));
       } catch (err: any) {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        reject(Errors.apiError(`Codex WS send failed: ${err?.message || err}`));
+        settle(() => reject(Errors.apiError(`Codex WS send failed: ${err?.message || err}`)));
       }
     });
 
@@ -251,11 +245,8 @@ export async function codexApiCallStream(
       }
 
       if (event.type === 'response.completed') {
-        if (settled) return;
-        settled = true;
-        cleanup();
         const latencyMs = Date.now() - startedAt;
-        resolve({
+        settle(() => resolve({
           response: {
             id: responseId,
             object: 'response',
@@ -265,40 +256,31 @@ export async function codexApiCallStream(
             usage,
           },
           latencyMs,
-        });
+        }));
       }
     });
 
-    ws.on('error', (err) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      reject(Errors.apiError(`Codex WS error: ${err?.message || err}`));
-    });
+    // Timer (per-message reset to catch stalls mid-stream)
+    const resetTimer = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        onEvent(`event: error\ndata: ${JSON.stringify({
+          type: 'error',
+          error: { type: 'timeout_error', message: `Request timed out after ${timeoutMs / 1000}s` },
+        })}\n\n`);
+        settle(() => reject(Errors.timeout(timeoutMs / 1000)));
+      }, timeoutMs);
+    };
+    resetTimer();
 
-    ws.on('close', (code, reason) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      const detail = reason?.toString('utf-8') || '';
-      reject(Errors.apiError(`Codex WS closed (${code})${detail ? `: ${detail}` : ''}`));
-    });
-
-    // Capture handshake HTTP failures explicitly (401, 403, 429 from upgrade)
-    ws.on('unexpected-response', (_req, res) => {
-      if (settled) return;
-      settled = true;
-      let body = '';
-      res.on('data', (chunk: Buffer) => { body += chunk.toString('utf-8'); });
-      res.on('end', () => {
-        cleanup();
-        reject(Errors.apiError(`Codex WS handshake failed (${res.statusCode}): ${body.slice(0, 400)}`));
-      });
-      res.on('error', () => {
-        cleanup();
-        reject(Errors.apiError(`Codex WS handshake failed (${res.statusCode})`));
-      });
-    });
+    // Abort wiring — AFTER handlers so any emissions have listeners.
+    if (abortSignal) {
+      if (abortSignal.aborted) {
+        settle(() => reject(new Error('Request aborted')));
+        return;
+      }
+      abortSignal.addEventListener('abort', onAbort, { once: true });
+    }
   });
 }
 
