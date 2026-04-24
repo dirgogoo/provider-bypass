@@ -32,15 +32,21 @@ export interface CodexResponse {
 }
 
 const REASONING_MODEL_RE = /^(gpt-5|o1|o3|o4)/i;
+const DEFAULT_REASONING_EFFORT = 'xhigh';
+const DEFAULT_REASONING_SUMMARY = 'auto';
 
 /**
  * ChatGPT backend always requires stream=true and store=false.
  *
- * For reasoning models (gpt-5.x, o1, o3, o4), we default `reasoning.summary`
- * to "auto" when the caller did not set it. Without a summary, long reasoning
- * phases emit no SSE events and edge proxies (Cloudflare etc.) drop the
- * connection after ~60-100s idle — surfacing as `terminated` errors mid-turn.
- * Summary="auto" keeps the stream alive with periodic partial outputs.
+ * For reasoning models (gpt-5.x, o1, o3, o4), we default `reasoning` to
+ * `{ effort: "xhigh", summary: "auto" }` when caller did not set them:
+ * - `effort: xhigh` maximizes reasoning depth (parity with Claude's
+ *   maximized thinking budget).
+ * - `summary: auto` keeps the SSE stream alive during long reasoning
+ *   phases — without it, edge proxies drop idle connections at ~60-100s,
+ *   surfacing as `terminated` errors mid-turn.
+ *
+ * Explicit caller values always win.
  */
 function buildRequestBody(options: CodexRequestOptions): any {
   const model = options.model || 'gpt-5.4';
@@ -57,13 +63,15 @@ function buildRequestBody(options: CodexRequestOptions): any {
   if (options.temperature !== undefined) body.temperature = options.temperature;
 
   const isReasoningModel = REASONING_MODEL_RE.test(model);
-  if (options.reasoning) {
+  if (isReasoningModel) {
+    const incoming = options.reasoning || {};
+    body.reasoning = {
+      ...incoming,
+      effort: incoming.effort ?? DEFAULT_REASONING_EFFORT,
+      summary: incoming.summary ?? DEFAULT_REASONING_SUMMARY,
+    };
+  } else if (options.reasoning) {
     body.reasoning = { ...options.reasoning };
-    if (isReasoningModel && !body.reasoning.summary) {
-      body.reasoning.summary = 'auto';
-    }
-  } else if (isReasoningModel) {
-    body.reasoning = { summary: 'auto' };
   }
 
   if (options.tools && options.tools.length > 0) {
