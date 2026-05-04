@@ -151,7 +151,8 @@ await ai.send({
 
 If the caller already sets `cache_control` on any system/tools/message block, the library **does not** inject additional breakpoints — explicit caller intent always wins. Codex/OpenAI models ignore this flag (OpenAI does automatic prompt caching server-side).
 
-Inspect `response.usage.cache_read_input_tokens` and `cache_creation_input_tokens` to verify.
+Inspect `response.usage.cache_read_input_tokens` and
+`response.usage.cache_creation_input_tokens` to verify.
 
 ## Configuration
 
@@ -166,7 +167,7 @@ const ai = createClient({
   },
   codex: {
     credentialPath: '~/.codex/auth.json',
-    apiUrl: 'https://chatgpt.com/backend-api/codex/responses',
+    apiUrl: 'wss://chatgpt.com/backend-api/codex/responses',
   },
 })
 ```
@@ -188,8 +189,8 @@ ai.destroy() // stops file watchers, clears registries
 
 | Provider | Models |
 |----------|--------|
-| Claude | `claude-sonnet-4-6`, `claude-opus-4-6`, any `claude-*` |
-| Codex/OpenAI | `gpt-5.4`, `gpt-5`, `o1-*`, `o3-*`, `o4-*`, any `gpt-*` |
+| Claude | `claude-opus-4-7`, `claude-sonnet-4-6`, `claude-opus-4-6`, any `claude-*` |
+| Codex/OpenAI | `gpt-5.5`, `gpt-5.4`, `gpt-5`, `o1-*`, `o3-*`, `o4-*`, any `gpt-*` |
 
 ## Response Format
 
