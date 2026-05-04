@@ -2,6 +2,7 @@ export type ErrorCode =
   | 'CREDENTIALS_NOT_FOUND'
   | 'TOKEN_EXPIRED'
   | 'REFRESH_FAILED'
+  | 'CLAUDE_EXTRA_USAGE_REQUIRED'
   | 'API_ERROR'
   | 'TIMEOUT'
   | 'INVALID_REQUEST'
@@ -30,6 +31,15 @@ export const Errors = {
 
   refreshFailed: (provider: string, cause?: unknown) =>
     new BypassError('REFRESH_FAILED', `Failed to refresh ${provider} token.`, cause),
+
+  claudeExtraUsageRequired: (providerMessage: string) =>
+    new BypassError(
+      'CLAUDE_EXTRA_USAGE_REQUIRED',
+      'Claude requires extra usage credits for third-party app requests. ' +
+      'Add extra usage at https://claude.ai/settings/usage, or switch this request ' +
+      'to a non-Claude model such as gpt-5.4. Token refresh or re-login will not ' +
+      `fix this until extra usage is enabled. Original Anthropic message: ${providerMessage}`,
+    ),
 
   apiError: (msg: string, cause?: unknown) =>
     new BypassError('API_ERROR', msg, cause),

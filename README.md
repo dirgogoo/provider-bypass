@@ -106,6 +106,29 @@ ai.presets.create({
 const tools = ai.presets.getTools('devops')
 ```
 
+### Reasoning
+
+Reasoning is provider-normalized. Clients express intent once and the library
+maps it to the right wire format for Claude or Codex/OpenAI.
+
+```typescript
+const res = await ai.send({
+  model: 'claude-opus-4-7',
+  input: [{ role: 'user', content: 'Solve this carefully...' }],
+  reasoning: {
+    effort: 'max',   // none | minimal | low | medium | high | xhigh | max
+    summary: 'auto', // auto = visible summary, none = hidden reasoning
+  },
+})
+```
+
+Reasoning models default to `{ effort: 'max', summary: 'auto' }`. Modern Claude
+models use adaptive thinking internally, while Codex/OpenAI models receive the
+strongest supported wire value (`max` maps to `xhigh` for Codex/OpenAI).
+Claude reasoning summaries are emitted as normalized
+`reasoning` output items and `response.reasoning_summary_text.delta` stream
+events.
+
 ### Prompt Caching (Claude)
 
 Automatic Anthropic prompt caching is **enabled by default** for Claude models. On every request the library injects `cache_control: { type: 'ephemeral' }` on:

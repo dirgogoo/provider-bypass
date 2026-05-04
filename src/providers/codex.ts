@@ -1,5 +1,6 @@
 import WebSocket from 'ws';
 import type { CodexAuth } from '../auth/codex-auth.js';
+import type { ReasoningConfig, ReasoningEffort } from '../types.js';
 import { generateId } from '../utils/id-generator.js';
 import { getInstallationId } from '../utils/installation-id.js';
 import { Errors } from '../utils/errors.js';
@@ -28,7 +29,7 @@ export interface CodexRequestOptions {
   parallel_tool_calls?: boolean;
   temperature?: number;
   max_output_tokens?: number;
-  reasoning?: { summary?: string; effort?: string };
+  reasoning?: ReasoningConfig;
   timeout?: number;
   /** Session UUID reused across calls → stable prompt_cache_key → cache hits. */
   sessionId?: string;
@@ -54,8 +55,14 @@ export interface CodexResponse {
 }
 
 const REASONING_MODEL_RE = /^(gpt-5|o1|o3|o4)/i;
-const DEFAULT_REASONING_EFFORT = 'xhigh';
+const DEFAULT_REASONING_EFFORT: ReasoningEffort = 'max';
 const DEFAULT_REASONING_SUMMARY = 'auto';
+
+function toCodexReasoningEffort(effort: ReasoningEffort): Exclude<ReasoningEffort, 'max'> {
+  // ChatGPT/Codex currently rejects "max" on the wire. In ProviderBypass,
+  // "max" means the strongest available setting for the selected provider.
+  return effort === 'max' ? 'xhigh' : effort;
+}
 
 /**
  * Build the WebSocket request frame (`type: "response.create"`).
@@ -66,18 +73,22 @@ const DEFAULT_REASONING_SUMMARY = 'auto';
  * prefix tokens (observed ~19% cache hit on the second turn, growing
  * as the conversation gets longer).
  */
-function buildFrame(options: CodexRequestOptions, sessionId: string): Record<string, any> {
+export function buildFrame(options: CodexRequestOptions, sessionId: string): Record<string, any> {
   const model = options.model || 'gpt-5.4';
   const isReasoning = REASONING_MODEL_RE.test(model);
 
   const reasoning = isReasoning
     ? {
-        effort: options.reasoning?.effort ?? DEFAULT_REASONING_EFFORT,
+        effort: toCodexReasoningEffort(options.reasoning?.effort ?? DEFAULT_REASONING_EFFORT),
         summary: options.reasoning?.summary ?? DEFAULT_REASONING_SUMMARY,
-        ...options.reasoning,
       }
     : options.reasoning
-    ? { ...options.reasoning }
+    ? {
+        ...options.reasoning,
+        ...(options.reasoning.effort
+          ? { effort: toCodexReasoningEffort(options.reasoning.effort) }
+          : {}),
+      }
     : undefined;
 
   const frame: Record<string, any> = {
@@ -255,6 +266,13 @@ export async function codexApiCallStream(
 
       // Forward to caller in SSE format (back-compat with parseCodexStreamEvent)
       onEvent(`event: ${event.type || 'message'}\ndata: ${JSON.stringify(event)}\n\n`);
+
+      if (event.type === 'error') {
+        const errType = event.error?.type || 'stream_error';
+        const errMsg = event.error?.message || JSON.stringify(event);
+        settle(() => reject(Errors.apiError(`Codex API Error (${errType}): ${errMsg}`)));
+        return;
+      }
 
       // Track state for final response
       if (event.type === 'response.created' || event.type === 'response.completed') {

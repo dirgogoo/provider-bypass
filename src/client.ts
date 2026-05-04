@@ -129,8 +129,9 @@ export class ProviderBypass {
     const result = await this.queue.add(() =>
       claudeApiCall(this.claudeAuth, this.claudeApiUrl, {
         model,
-        max_tokens: request.max_output_tokens || 16384,
+        max_tokens: request.max_output_tokens,
         temperature: request.temperature,
+        reasoning: request.reasoning,
         system: request.instructions,
         messages,
         tools: claudeTools,
@@ -184,8 +185,9 @@ export class ProviderBypass {
     const apiPromise = this.queue.add(() =>
       claudeApiCallStream(this.claudeAuth, this.claudeApiUrl, {
         model,
-        max_tokens: request.max_output_tokens || 16384,
+        max_tokens: request.max_output_tokens,
         temperature: request.temperature,
+        reasoning: request.reasoning,
         system: request.instructions,
         messages,
         tools: claudeTools,

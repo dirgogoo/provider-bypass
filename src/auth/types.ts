@@ -18,4 +18,8 @@ export interface AuthConfig {
   credentialPath?: string;
   refreshCommand?: string;
   apiUrl?: string;
+  /** Claude only: stable session id sent as x-claude-code-session-id. */
+  sessionId?: string;
+  /** Claude only: user-agent override. */
+  userAgent?: string;
 }

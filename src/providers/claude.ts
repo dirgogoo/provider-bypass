@@ -1,5 +1,5 @@
 import type { ClaudeAuth } from '../auth/claude-auth.js';
-import type { Logger } from '../types.js';
+import type { Logger, ReasoningConfig, ReasoningEffort, ReasoningSummary } from '../types.js';
 import { generateId } from '../utils/id-generator.js';
 import { Errors } from '../utils/errors.js';
 
@@ -22,6 +22,7 @@ export interface ClaudeRequestOptions {
   model?: string;
   max_tokens?: number;
   temperature?: number;
+  reasoning?: ReasoningConfig;
   system?: string | Array<{ type: string; text: string; cache_control?: any }>;
   messages: ClaudeMessage[];
   tools?: ClaudeTool[];
@@ -53,8 +54,8 @@ export interface ClaudeResponse {
 // a misleading HTTP 429 rate_limit_error even when quota is fine.
 const CLAUDE_CODE_IDENTIFIER = "You are Claude Code, Anthropic's official CLI for Claude.";
 
-// Per-model output ceiling (mirrors Claude Code's getModelMaxOutputTokens).
-// Thinking budget can go up to maxOutputTokens; we reserve 1024 for the answer.
+// Per-model output ceiling. Modern Claude Code currently defaults to 32k
+// output while relying on adaptive thinking + output_config.effort.
 function getModelMaxOutput(model: string): number {
   const m = model.toLowerCase();
   if (m.includes('opus-4-7') || m.includes('opus-4-6') || m.includes('sonnet-4-6')) return 128_000;
@@ -63,6 +64,54 @@ function getModelMaxOutput(model: string): number {
   if (m.includes('claude-3-opus') || m.includes('claude-3-haiku')) return 4_096;
   if (m.includes('claude-3-sonnet') || m.includes('3-5-sonnet') || m.includes('3-5-haiku')) return 8_192;
   return 64_000;
+}
+
+function getDefaultMaxOutput(model: string): number {
+  const m = model.toLowerCase();
+  if (isModernAdaptiveThinkingModel(m)) return 32_000;
+  if (m.includes('opus')) return 32_000;
+  if (m.includes('claude')) return 16_384;
+  return 16_384;
+}
+
+function isModernAdaptiveThinkingModel(model: string): boolean {
+  const m = model.toLowerCase();
+  return m.includes('opus-4-7') || m.includes('opus-4-6') || m.includes('sonnet-4-6');
+}
+
+function isLegacyExtendedThinkingModel(model: string): boolean {
+  const m = model.toLowerCase();
+  return m.includes('3-7-sonnet') || m.includes('opus-4') || m.includes('sonnet-4');
+}
+
+function normalizeReasoning(model: string, reasoning?: ReasoningConfig): ReasoningConfig | undefined {
+  if (!reasoning && !isModernAdaptiveThinkingModel(model) && !isLegacyExtendedThinkingModel(model)) {
+    return undefined;
+  }
+
+  return {
+    effort: reasoning?.effort ?? 'max',
+    summary: reasoning?.summary ?? 'auto',
+  };
+}
+
+function claudeThinkingDisplay(summary: ReasoningSummary | undefined): 'summarized' | 'omitted' {
+  return summary === 'none' ? 'omitted' : 'summarized';
+}
+
+function toClaudeAdaptiveEffort(effort: ReasoningEffort | undefined): 'low' | 'medium' | 'high' | 'max' {
+  if (effort === 'medium' || effort === 'high') return effort;
+  if (effort === 'low' || effort === 'minimal' || effort === 'none') return 'low';
+  return 'max';
+}
+
+function clampMaxTokens(requested: number | undefined, model: string): number {
+  return Math.min(requested ?? getDefaultMaxOutput(model), getModelMaxOutput(model));
+}
+
+function legacyThinkingBudget(maxTokens: number): number | null {
+  if (maxTokens <= 1024) return null;
+  return Math.max(Math.min(maxTokens - 1024, maxTokens - 1), 1024);
 }
 
 const EPHEMERAL: { type: 'ephemeral' } = { type: 'ephemeral' };
@@ -114,7 +163,7 @@ function markLastMessageWithCache(messages: ClaudeMessage[]): ClaudeMessage[] {
   return [...messages.slice(0, -1), { ...last, content: newContent }];
 }
 
-function buildRequestBody(options: ClaudeRequestOptions): any {
+export function buildRequestBody(options: ClaudeRequestOptions): any {
   const cacheEnabled = options.cache !== 'none';
 
   let userSystem: any[] = [];
@@ -139,10 +188,10 @@ function buildRequestBody(options: ClaudeRequestOptions): any {
   if (cacheEnabled) system = markLastWithCache(system);
 
   const model = options.model || 'claude-sonnet-4-6';
-  const modelMaxOutput = getModelMaxOutput(model);
-  // Reserve ~1k for the actual answer; the rest is available for thinking.
-  const thinkingBudget = Math.max(modelMaxOutput - 1024, 1024);
-  const maxTokens = options.max_tokens || modelMaxOutput;
+  const maxTokens = clampMaxTokens(options.max_tokens, model);
+  const reasoning = normalizeReasoning(model, options.reasoning);
+  const usesAdaptiveThinking = !!reasoning && isModernAdaptiveThinkingModel(model);
+  const usesLegacyThinking = !!reasoning && !usesAdaptiveThinking && isLegacyExtendedThinkingModel(model);
 
   const messages = cacheEnabled
     ? markLastMessageWithCache(options.messages)
@@ -153,17 +202,25 @@ function buildRequestBody(options: ClaudeRequestOptions): any {
     stream: options.stream || false,
     messages,
     system,
+    max_tokens: maxTokens,
   };
 
-  if (options.temperature !== undefined) {
-    // User set temperature explicitly — no thinking
+  if (usesAdaptiveThinking) {
+    body.thinking = {
+      type: 'adaptive',
+      display: claudeThinkingDisplay(reasoning.summary),
+    };
+    body.output_config = { effort: toClaudeAdaptiveEffort(reasoning.effort) };
+  } else if (usesLegacyThinking) {
+    const budget = legacyThinkingBudget(maxTokens);
+    if (budget) {
+      body.thinking = { type: 'enabled', budget_tokens: budget };
+    }
+  }
+
+  if (options.temperature !== undefined && !usesAdaptiveThinking) {
+    // Modern Claude reasoning models reject/deprecate temperature.
     body.temperature = options.temperature;
-    body.max_tokens = Math.min(maxTokens, modelMaxOutput);
-  } else {
-    // Enable thinking by default (requires temperature=1, max_tokens > budget_tokens)
-    body.temperature = 1;
-    body.thinking = { type: 'enabled', budget_tokens: thinkingBudget };
-    body.max_tokens = Math.min(Math.max(maxTokens, thinkingBudget + 1024), modelMaxOutput);
   }
 
   if (options.tools && options.tools.length > 0) {
@@ -187,6 +244,36 @@ function cleanContent(content: any[]): any[] {
       const { caller, ...rest } = b;
       return rest;
     });
+}
+
+interface ClaudeErrorDetails {
+  type: string;
+  message: string;
+}
+
+const EXTRA_USAGE_RE = /third-party apps now draw from your extra usage|claude\.ai\/settings\/usage/i;
+
+function extractClaudeError(data: any, status: number): ClaudeErrorDetails {
+  return {
+    type: data?.error?.type || `http_${status}`,
+    message: data?.error?.message || JSON.stringify(data),
+  };
+}
+
+export function claudeApiError(type: string, message: string): Error {
+  if (type === 'invalid_request_error' && EXTRA_USAGE_RE.test(message)) {
+    return Errors.claudeExtraUsageRequired(message);
+  }
+
+  if (type === 'rate_limit_error' && message === 'Error') {
+    return Errors.apiError(
+      `Claude API Error (${type}): ${message} — this usually means the ` +
+      `system prompt is missing the Claude Code identifier. provider-bypass ` +
+      `should prepend it automatically; if you see this, file a bug.`,
+    );
+  }
+
+  return Errors.apiError(`Claude API Error (${type}): ${message}`);
 }
 
 /**
@@ -227,16 +314,8 @@ export async function claudeApiCall(
     }
 
     if (!res.ok || data.type === 'error') {
-      const errType = data.error?.type || `http_${res.status}`;
-      const errMsg = data.error?.message || JSON.stringify(data);
-      if (errType === 'rate_limit_error' && errMsg === 'Error') {
-        throw Errors.apiError(
-          `Claude API Error (${errType}): ${errMsg} — this usually means the ` +
-          `system prompt is missing the Claude Code identifier. provider-bypass ` +
-          `should prepend it automatically; if you see this, file a bug.`,
-        );
-      }
-      throw Errors.apiError(`Claude API Error (${errType}): ${errMsg}`);
+      const err = extractClaudeError(data, res.status);
+      throw claudeApiError(err.type, err.message);
     }
 
     const latencyMs = Date.now() - startTime;
@@ -318,14 +397,17 @@ export async function claudeApiCallStream(
     });
 
     if (!res.ok || !res.body) {
+      let errType = `http_${res.status}`;
       let errMsg: string;
       try {
         const data = await res.json() as any;
-        errMsg = `${data.error?.type || 'http_' + res.status}: ${data.error?.message || JSON.stringify(data)}`;
+        const err = extractClaudeError(data, res.status);
+        errType = err.type;
+        errMsg = err.message;
       } catch {
         errMsg = `http_${res.status}: ${await res.text().catch(() => 'unknown')}`;
       }
-      throw Errors.apiError(`Claude API Error (${errMsg})`);
+      throw claudeApiError(errType, errMsg);
     }
 
     const reader = res.body.getReader();
@@ -342,6 +424,7 @@ export async function claudeApiCallStream(
     const contentBlocks: any[] = [];
     const indexMap = new Map<number, number>();
     let nextCleanIndex = 0;
+    let streamError: Error | null = null;
 
     while (true) {
       const { done, value } = await reader.read();
@@ -454,6 +537,9 @@ export async function claudeApiCallStream(
 
           if (event.type === 'error') {
             onEvent(`event: error\ndata: ${JSON.stringify(event)}\n\n`);
+            const errType = event.error?.type || 'stream_error';
+            const errMsg = event.error?.message || JSON.stringify(event);
+            streamError = claudeApiError(errType, errMsg);
             continue;
           }
 
@@ -462,6 +548,8 @@ export async function claudeApiCallStream(
         }
       }
     }
+
+    if (streamError) throw streamError;
 
     const latencyMs = Date.now() - startTime;
 

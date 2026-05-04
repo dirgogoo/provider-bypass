@@ -14,6 +14,10 @@ export interface ClientOptions {
     credentialPath?: string;
     refreshCommand?: string;
     apiUrl?: string;
+    /** Stable session id sent as x-claude-code-session-id. Generated if omitted. */
+    sessionId?: string;
+    /** Claude API User-Agent override. Defaults to the observed Claude Code SDK UA. */
+    userAgent?: string;
   };
   /** Codex auth config overrides */
   codex?: {
@@ -32,6 +36,16 @@ export interface ClientOptions {
 }
 
 // ─── Request / Response ───
+
+export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+export type ReasoningSummary = 'auto' | 'none';
+
+export interface ReasoningConfig {
+  /** Reasoning quality/latency tradeoff. Defaults to 'max' on reasoning models. */
+  effort?: ReasoningEffort;
+  /** Whether to expose summarized reasoning events. Defaults to 'auto'. */
+  summary?: ReasoningSummary;
+}
 
 export interface SendRequest {
   /** Model name. Routes to Claude or Codex based on prefix. */
@@ -52,8 +66,8 @@ export interface SendRequest {
   temperature?: number;
   /** Max output tokens */
   max_output_tokens?: number;
-  /** Reasoning config (Codex only) */
-  reasoning?: { summary?: string; effort?: string };
+  /** Provider-normalized reasoning config. Defaults to max + summarized on reasoning models. */
+  reasoning?: ReasoningConfig;
   /** Abort signal for cancellation */
   signal?: AbortSignal;
   /** Per-request timeout override (ms) */
